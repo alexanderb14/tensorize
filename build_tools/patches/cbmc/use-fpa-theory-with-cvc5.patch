@@ -1,0 +1,24 @@
+From e72c5779f4609c5e0a6a0316021bccdc416d535e Mon Sep 17 00:00:00 2001
+From: Alexander Brauckmann <a.brauckmann@gmail.com>
+Date: Sat, 25 Nov 2023 19:38:48 +0000
+Subject: [PATCH] Use FPA theory with CVC5
+
+---
+ src/solvers/smt2/smt2_conv.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/solvers/smt2/smt2_conv.cpp b/src/solvers/smt2/smt2_conv.cpp
+index 839b164ee0..96ee8abfd2 100644
+--- a/src/solvers/smt2/smt2_conv.cpp
++++ b/src/solvers/smt2/smt2_conv.cpp
+@@ -114,6 +114,7 @@ smt2_convt::smt2_convt(
+ 
+   case solvert::CVC5:
+     logic = "ALL";
++    use_FPA_theory = true;
+     use_array_of_bool = true;
+     use_as_const = true;
+     use_check_sat_assuming = true;
+-- 
+2.34.1
+
