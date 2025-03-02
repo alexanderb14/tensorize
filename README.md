@@ -10,6 +10,10 @@ It uses an algebraic solver to rapidly simplify the specification, resulting in 
 
 We evaluate Tensorize on  several legacy code benchmarks and compare against state-of-the-art techniques. Tensorize is able to lift more code than prior schemes, is an order of magnitude faster in synthesis time, and guarantees correctness by construction.
 
+## Link to Paper
+
+[https://dl.acm.org/doi/10.1145/3696443.3708956](https://dl.acm.org/doi/10.1145/3696443.3708956)
+
 ## Reproducing Paper Results
 
 Run our docker-based workflow with
