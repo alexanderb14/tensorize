@@ -18,7 +18,7 @@ We evaluate Tensorize on  several legacy code benchmarks and compare against sta
 
 Run our docker-based workflow with
 ```
-./ run_all . sh
+./run_all.sh
 ```
 
 ## Development Setup
