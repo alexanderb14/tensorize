@@ -9,7 +9,7 @@ from sympy import *
 
 
 NUM_CPUS = (
-    int(os.environ.get("NUM_CPUS")) if "NUM_CPUS" in os.environ else os.cpu_count()
+    int(os.environ.get("NUM_CPUS")) if "NUM_CPUS" in os.environ else len(os.sched_getaffinity(0))
 )
 
 FLAGS = flags.FLAGS
@@ -17,6 +17,19 @@ FLAGS = flags.FLAGS
 
 def init_args():
     flags.FLAGS(sys.argv)
+
+
+class fmod(Function):
+    """C's fmod (arith.remf), kept opaque unless both arguments are numbers."""
+
+    @classmethod
+    def eval(cls, a, b):
+        if a.is_Number and b.is_Number and b != 0:
+            return sign(a) * Mod(Abs(a), Abs(b))
+
+    def _eval_evalf(self, prec):  # by default, evalf would call mpmath.fmod
+        return fmod(*[x.evalf(prec) for x in self.args]).evalf(prec) \
+            if all(x.evalf(prec).is_Number for x in self.args) else None
 
 
 def run(func_py, inputs):

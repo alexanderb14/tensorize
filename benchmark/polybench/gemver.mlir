@@ -2,6 +2,20 @@ module {
   func.func @kernel_gemver(%arg0: i32, %arg1: f64, %arg2: f64, %arg3: memref<2000x2000xf64>, %arg4: memref<2000xf64>, %arg5: memref<2000xf64>, %arg6: memref<2000xf64>, %arg7: memref<2000xf64>, %arg8: memref<2000xf64>, %arg9: memref<2000xf64>, %arg10: memref<2000xf64>, %arg11: memref<2000xf64>) attributes {llvm.linkage = #llvm.linkage<external>} {
     affine.for %arg12 = 0 to 2000 {
       affine.for %arg13 = 0 to 2000 {
+        %0 = affine.load %arg3[%arg12, %arg13] : memref<2000x2000xf64>
+        %1 = affine.load %arg4[%arg12] : memref<2000xf64>
+        %2 = affine.load %arg5[%arg13] : memref<2000xf64>
+        %3 = arith.mulf %1, %2 : f64
+        %4 = arith.addf %0, %3 : f64
+        %5 = affine.load %arg6[%arg12] : memref<2000xf64>
+        %6 = affine.load %arg7[%arg13] : memref<2000xf64>
+        %7 = arith.mulf %5, %6 : f64
+        %8 = arith.addf %4, %7 : f64
+        affine.store %8, %arg3[%arg12, %arg13] : memref<2000x2000xf64>
+      }
+    }
+    affine.for %arg12 = 0 to 2000 {
+      affine.for %arg13 = 0 to 2000 {
         %0 = affine.load %arg9[%arg12] : memref<2000xf64>
         %1 = affine.load %arg3[%arg13, %arg12] : memref<2000x2000xf64>
         %2 = arith.mulf %arg2, %1 : f64

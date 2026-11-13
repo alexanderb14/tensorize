@@ -2,6 +2,10 @@
 
 ![image info](./docs/tensorize.png)
 
+> **Version 2 (October 2026)** corrects several benchmark inputs and fixes bugs
+> that made emitted programs incorrect or not executable.
+> See the [changelog](#changelog) for details.
+
 ## Why Tensorize?
 
 ### The Problem
@@ -10,7 +14,7 @@ Tensor Domain-Specific Languages (DSLs) such as NumPy, JAX, and StableHLO delive
 
 ### The Solution
 
-Tensorize is an MLIR-based compiler that automatically lifts loop-level code from legacy codebases to high-level Tensor DSLs using program synthesis. It constructs a symbolic trace of the loop-level program as a specification and synthesizes a functionally equivalent Tensor DSL program. The approach employs Tensor DSL sketching and recursive symbolic simplification, ensuring the correctness of the compilationtransformation
+Tensorize is an MLIR-based compiler that automatically lifts loop-level code from legacy codebases to high-level Tensor DSLs using program synthesis. It constructs a symbolic trace of the loop-level program as a specification and synthesizes a functionally equivalent Tensor DSL program. The approach employs Tensor DSL sketching and recursive symbolic simplification, ensuring the correctness of the transformation.
 
 ### Key Features
 
@@ -70,6 +74,28 @@ Rapidly simplifies symbolic trace using Tensor DSL sketches, by using a symbolic
 
 More details can be found in our paper: [https://dl.acm.org/doi/10.1145/3696443.3708956](https://dl.acm.org/doi/10.1145/3696443.3708956).
 
+## Changelog
+
+### Version 2.0 (November 2026)
+
+Version 2 corrects the benchmark inputs and fixes bugs in Tensorize's
+implementation. The synthesis algorithm described in the paper is unchanged.
+
+All 97 inputs were checked against their unmodified references by executing
+both on random inputs and comparing every output.
+Version 2 further fixes how emitted programs name, return and order their arguments
+and operands, boolean masks, loop nests with several outputs, and annotated (symmetric
+or triangular) inputs. The synthesis algorithm remains unchanged.
+
+With version 2, Tensorize emits a correct program for each of the 97
+benchmark inputs, verified by executing every emitted program against its
+MLIR input and its C/C++ reference.
+
+### Version 1.0 (November 2024)
+
+Initial release, the artifact of the CGO 2025 paper:
+[doi.org/10.5281/zenodo.14095398](https://doi.org/10.5281/zenodo.14095398).
+
 ## Cite Our Work
 
 ```
@@ -81,3 +107,4 @@ More details can be found in our paper: [https://dl.acm.org/doi/10.1145/3696443.
   year={2025}
 }
 ```
+

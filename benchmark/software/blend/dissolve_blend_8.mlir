@@ -11,7 +11,9 @@ module {
         %3 = arith.addf %2, %cst_0 : f64
         %4 = arith.divf %3, %cst_1 : f64
         %5 = arith.subf %arg2, %4 : f64
-        affine.store %5, %arg0[%arg4, %arg5] : memref<1000x1000xf64>
+        %6 = arith.cmpf oge, %5, %cst : f64
+        %7 = arith.select %6, %1, %0 : f64
+        affine.store %7, %arg0[%arg4, %arg5] : memref<1000x1000xf64>
       }
     }
     return

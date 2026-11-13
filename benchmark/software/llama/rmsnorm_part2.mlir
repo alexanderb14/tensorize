@@ -3,7 +3,7 @@ module {
     affine.for %arg3 = 0 to 1 {
       %0 = affine.load %arg2[] : memref<f64>
       %cst = arith.constant 1.000000e+00 : f64
-      %cst_0 = arith.constant 3.000000e+00 : f64
+      %cst_0 = arith.constant 1.000000e+03 : f64
       %1 = arith.divf %0, %cst_0 : f64
       %2 = arith.addf %1, %cst : f64
       %3 = math.sqrt %2 : f64

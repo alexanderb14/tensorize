@@ -1,7 +1,10 @@
+import contextlib
 import copy
 import itertools
 import logging
+import signal
 import stopit
+import threading
 from collections import ChainMap
 from enum import Enum
 
@@ -11,9 +14,56 @@ from sympy.core.numbers import *
 from sympy.core.relational import *
 from sympy.parsing.sympy_parser import parse_expr
 
+from common_helpers import fmod
+
 
 stopit_logger = logging.getLogger("stopit")
 stopit_logger.setLevel(logging.ERROR)
+
+
+class SolverTimeout(BaseException):
+    """A BaseException, so that code catching Exception cannot swallow it."""
+
+
+@contextlib.contextmanager
+def time_limit(seconds):
+    """Wall-clock limit; SIGALRM in the main thread, stopit elsewhere. stopit's
+    exception can be swallowed by sympy code catching Exception, and an
+    exception raised in a callback (e.g. of the garbage collector) is lost, so
+    the signal repeats every 50 ms until the block is left."""
+    if (threading.current_thread() is not threading.main_thread()
+            or signal.getitimer(signal.ITIMER_REAL)[0] > 0):  # nested
+        with stopit.ThreadingTimeout(seconds) as ctx:
+            yield
+        if ctx.state == ctx.TIMED_OUT:
+            raise SolverTimeout()
+        return
+
+    def handler(signum, frame):
+        raise SolverTimeout()
+
+    previous = signal.signal(signal.SIGALRM, handler)
+    signal.setitimer(signal.ITIMER_REAL, seconds, 0.05)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def is_numerically_nonzero(expr):
+    """True if expr is clearly nonzero at some point (then it is not zero)."""
+    symbols = sorted(expr.free_symbols, key=str)
+    for trial in range(2):
+        point = {s: sympy.Rational((7 * i + 13 * trial) % 19 - 9, (3 * i + trial) % 5 + 2)
+                 for i, s in enumerate(symbols)}
+        try:
+            value = complex(expr.xreplace(point).evalf())
+        except (TypeError, ValueError, ZeroDivisionError, AttributeError):
+            continue
+        if value == value and abs(value) != float("inf") and abs(value) > 1e-6:
+            return True
+    return False
 
 
 class ArgProperty(Enum):
@@ -297,7 +347,7 @@ def reparse_without_eval_nd(syms):
     def helper(syms):
         if isinstance(syms, list):
             return [helper(s) for s in syms]
-        return parse_expr(str(syms), evaluate=False)
+        return parse_expr(str(syms), local_dict={"fmod": fmod}, evaluate=False)
 
     return helper(syms)
 
@@ -537,13 +587,13 @@ def solve_nd(eq, unknowns, solution_shape):
             return Done()
 
         try:
-            with stopit.ThreadingTimeout(1, swallow_exc=False) as timeout_ctx:
+            with time_limit(1):
                 solutions = sympy.solvers.solve(eq, list(unknowns), dict=True)
-        except stopit.utils.TimeoutException as e:
+        except SolverTimeout:
             # print("Warning: Timeout exceeded in sympy.solvers.solve")
             solutions = []
             pass
-        except (NotImplementedError, TypeError, KeyError) as e:
+        except (NotImplementedError, TypeError, KeyError, RecursionError) as e:
             # print("Warning: Exception in sympy.solvers.solve: " + str(e))
             solutions = []
             pass
@@ -553,13 +603,34 @@ def solve_nd(eq, unknowns, solution_shape):
             solutions = []
             pass
 
-        # Check if the solution is valid
-        for solution in solutions:
-            # Check if substitution is valid
-            if sympy.simplify(eq.subs(solution)) != 0:
-                solutions.remove(solution)
+        # Check if the solution is valid. Float coefficients (e.g. exp(-1.0*x)
+        # vs. exp(-x)) can keep simplify from cancelling an exact residual.
+        def is_valid(solution):
+            residual = eq.subs(solution)
+            if is_numerically_nonzero(residual):
+                return False
+            try:
+                with time_limit(10):
+                    return (sympy.simplify(residual) == 0 or
+                            sympy.simplify(sympy.nsimplify(residual, rational=True)) == 0)
+            except SolverTimeout:
+                return False
 
-        solutions = dict(ChainMap(*solutions))
+        # Same result as dict(ChainMap(*valid solutions)): each unknown takes its
+        # value from the first valid solution that contains it. Solutions that
+        # cannot contribute a new unknown are not validated (e.g. the 32
+        # complex roots of X**32 = c), since validation is expensive.
+        needed = set().union(*(s.keys() for s in solutions))
+        merged = {}
+        for solution in solutions:
+            if needed <= merged.keys():
+                break
+            if not (solution.keys() - merged.keys()):
+                continue
+            if is_valid(solution):
+                for k, v in solution.items():
+                    merged.setdefault(k, v)
+        solutions = merged
         solutions = {str(k): v for k, v in solutions.items()}
 
         # - If there are no solutions and the equation is non zero, then the solution is invalid
@@ -598,9 +669,9 @@ def apply_nd(syms, func=sympy.simplify, timeout=1):
         return func(syms)
 
     try:
-        with stopit.ThreadingTimeout(timeout, swallow_exc=False):
+        with time_limit(timeout):
             return helper(syms), "ok"
-    except stopit.utils.TimeoutException as e:
+    except SolverTimeout:
         print("Warning: Timeout in apply_nd for function: " + str(func.__name__))
         return None, "timeout_" + str(func.__name__)
 

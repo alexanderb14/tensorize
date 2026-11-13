@@ -26,6 +26,27 @@ flags.DEFINE_string("target", "numpy", "Raising target")
 flags.DEFINE_integer("max_num_ops", sys.maxsize, "Maximum number of operations")
 
 
+def distribution_is_legal(program_contents):
+    """Whether loop distribution preserves the final value of every argument,
+    compared on the symbolic traces of the whole program. Some distributions
+    are not legal, e.g. in polybench/doitgen, where the reset of the `sum`
+    array in the outer loop ends up in a different nest than its uses."""
+    traces = []
+    for passes in (["change-sizes{sizes=Primes}"],
+                   ["change-sizes{sizes=Primes}", "distribute-loops"]):
+        with Context():
+            mlir_synth.register_dialects()
+            mlir_synth.register_passes()
+            module = Module.parse(program_contents)
+            PassManager.parse(",".join(passes)).run(module)
+            module_str = str(module)
+        traces.append(str(trace_final_args(module_str)))
+    if traces[0] != traces[1]:
+        print("Loop distribution changes the program's semantics, not distributing")
+        return False
+    return True
+
+
 def main(argv):
     with open(FLAGS.program, "r") as f:
         program_contents = f.read()
@@ -55,6 +76,20 @@ def main(argv):
         module = Module.parse(program_contents)
         pm = PassManager.parse(",".join(passes))
         pm.run(module)
+        multi_output = not FLAGS.distribute and has_multi_output_functions(module)
+
+    # An outlined loop nest returns only one of the arrays it writes. If a loop
+    # nest writes several, synthesize the distributed program instead, if
+    # distribution preserves the program's semantics, and fall back to this
+    # one if that fails.
+    if multi_output and distribution_is_legal(program_contents):
+        FLAGS.distribute = True
+        try:
+            return main(argv)
+        except AssertionError:
+            print("Synthesis of the distributed program failed, retrying without loop distribution")
+        finally:
+            FLAGS.distribute = False
 
     target.initialize_ast(module)
 

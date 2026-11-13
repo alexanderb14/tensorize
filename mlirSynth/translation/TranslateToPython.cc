@@ -277,7 +277,14 @@ static LogicalResult printOperation(PythonEmitter &emitter,
                                     arith::RemFOp remfOp) {
   Operation *operation = remfOp.getOperation();
 
-  return printBinaryArithOperation(emitter, operation, "%");
+  // arith.remf has the semantics of C's fmod (the result has the sign of the
+  // dividend), not of Python's floored %. fmod is defined on the Python side.
+  raw_ostream &os = emitter.ostream();
+  if (failed(emitter.emitAssignPrefix(*operation)))
+    return failure();
+  os << " fmod(" << emitter.getOrCreateName(operation->getOperand(0)) << ", "
+     << emitter.getOrCreateName(operation->getOperand(1)) << ")";
+  return success();
 }
 
 static LogicalResult printOperation(PythonEmitter &emitter,
@@ -324,6 +331,8 @@ static LogicalResult printOperation(PythonEmitter &emitter,
     return printCompareArithOperation(emitter, operation, "==");
   case arith::CmpIPredicate::sge:
     return printCompareArithOperation(emitter, operation, ">=");
+  case arith::CmpIPredicate::slt:
+    return printCompareArithOperation(emitter, operation, "<");
   default:
     return operation->emitError("unsupported integer comparison predicate in "
                                 "arith.cmpi operation: " +

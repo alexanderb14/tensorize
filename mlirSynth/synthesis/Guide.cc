@@ -268,6 +268,7 @@ std::vector<std::string> predictOps(std::vector<std::string> &supportedOps,
   }
 
   if (countNumOps<arith::RemFOp>(op) > 0) {
+    ops.emplace_back("jnp.fmod");
     ops.emplace_back("jnp.remainder");
   }
 

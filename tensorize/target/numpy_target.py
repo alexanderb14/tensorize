@@ -2,6 +2,7 @@ import ast
 import copy
 import itertools
 import math
+import re as regex  # "re" is shadowed by sympy.re through star imports
 
 import jax
 import jax.numpy as jnp
@@ -30,6 +31,7 @@ NUMPY_GRAMMAR = [
     (jnp.subtract, float, [float, float]),
     (jnp.multiply, float, [float, float]),
     (jnp.remainder, float, [float, float]),
+    (jnp.fmod, float, [float, float]),
     (jnp.dot, float, [float, float]),
     (jnp.tensordot, float, [float, float]),
     (jnp.equal, bool, [float, float]),
@@ -132,7 +134,7 @@ class Candidate:
         self.fn = str(ast.unparse(ast.fix_missing_locations(fn_ast)))
 
 
-def get_initial_candidates(arg_shapes, constants):
+def get_initial_candidates(arg_shapes, constants, masks=()):
     candidates = {float: [], bool: []}
 
     # - Each arg
@@ -194,6 +196,14 @@ def get_initial_candidates(arg_shapes, constants):
             "jnp.eye({}, dtype=bool)".format(arg_shape[0]) if len(arg_shape) else "True"
         )
         candidates[bool].append(Candidate("def foo(): return {}".format(arg)))
+
+    # Masks for arrays that a loop stores to only partly (1.0 at the indices
+    # a .. S-1-b), written in terms of the size S for restore_sizes.
+    for size, a, b in masks:
+        conds = ["(jnp.arange({}) >= {})".format(size, a)] if a else []
+        conds += ["(jnp.arange({}) < {} - {})".format(size, size, b)] if b else []
+        arg = "jnp.where({}, 1.0, 0.0)".format(" & ".join(conds))
+        candidates[float].append(Candidate("def foo(): return {}".format(arg)))
 
     return candidates
 
@@ -355,8 +365,8 @@ def enumerate_candidates_worker(task):
     return new_candidates
 
 
-def enumerate_candidates(arg_shapes, ops, constants, max_depth=1):
-    last_candidates = get_initial_candidates(arg_shapes, constants)
+def enumerate_candidates(arg_shapes, ops, constants, max_depth=1, masks=()):
+    last_candidates = get_initial_candidates(arg_shapes, constants, masks)
 
     # Create candidates for operations by generating operands with
     # cartesian product of initial candidates
@@ -491,27 +501,146 @@ def get_last_function(py_str):
     return ast.unparse(last_func)
 
 
-def replace_return_value(py_str):
+def get_returned_arg_idxs(module):
+    """
+    For each outlined function, the index of the argument whose new value it
+    returns (outlined functions return one of their memref arguments).
+    """
+    idxs = {}
+    for op in module.body.operations:
+        if isinstance(op, FuncOp) and "irsynth.original" in op.attributes:
+            name = StringAttr(op.attributes["sym_name"]).value
+            m = regex.search(r"return %arg(\d+) :", str(op))
+            if m:
+                idxs[name] = int(m.group(1))
+    return idxs
+
+
+def get_main_arg_shapes(module):
+    """Shapes of the arguments of the main (last) function; None for scalars."""
+    funcs = [op for op in module.body.operations if isinstance(op, FuncOp)]
+    shapes = []
+    for arg in funcs[-1].regions[0].blocks[0].arguments:
+        if ShapedType.isinstance(arg.type):
+            shapes.append(list(ShapedType(arg.type).shape))
+        else:
+            shapes.append(None)
+    return shapes
+
+
+PROLOGUES = {
+    "irsynth.symmetric": "jnp.tril({a}) + jnp.transpose(jnp.tril({a}, -1))",
+    "irsynth.lower_triangular": "jnp.tril({a}, -1) + jnp.eye({a}.shape[0], dtype={a}.dtype)",
+}
+
+SET_AT_PY = """def set_at(a, idx, value):
+    a = np.array(a, copy=True)
+    a[idx] = value
+    return a
+"""
+
+
+def replace_return_value(py_str, returned_arg_idxs, arg_shapes):
+    """
+    Make the main function return the final value of every argument that is
+    written by one of the outlined functions or by a store outside of loops,
+    in argument order. A single output is returned as is, several outputs as a
+    tuple.
+
+    Stores outside of loops (e.g. `v5[v8][v8] = v9`) are turned into
+    functional updates `set_at(<current value>, (i, j), value)`. Indices equal
+    to the last index of a dimension are written as -1, so that they do not
+    depend on the problem size.
+    """
     tree = ast.parse(py_str)
     last_func = tree.body[-1]
 
-    # Get the value of the last function call
     assert isinstance(last_func.body[-1], ast.Return)
 
+    # Track which original argument each call result is the new value of.
+    params = [arg.arg for arg in last_func.args.args]
+    origin = {param: param for param in params}
+    last_value = {}
+    constants = {}
+    new_values = []
     last_call = None
-    for stmt in last_func.body:
-        if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
-            last_call = stmt.value
-    assert last_call
+    for stmt_idx, stmt in enumerate(last_func.body):
+        if not isinstance(stmt, ast.Assign):
+            continue
+        target = stmt.targets[0]
+        if isinstance(target, ast.Name) and isinstance(stmt.value, ast.Constant):
+            constants[target.id] = stmt.value.value
+        elif isinstance(target, ast.Name) and isinstance(stmt.value, ast.Call):
+            callee = stmt.value.func.id
+            last_call = target.id
+            if callee not in returned_arg_idxs:
+                # Returns a new value (e.g. a reduction into an alloca)
+                new_values.append(target.id)
+                continue
+            root = origin[stmt.value.args[returned_arg_idxs[callee]].id]
+            origin[target.id] = root
+            last_value[root] = target.id
+        elif isinstance(target, ast.Subscript):
+            # Collect the indices of e.g. v5[v8][v8] or v5[v8, v8].
+            indices = []
+            node = target
+            while isinstance(node, ast.Subscript):
+                sl = node.slice
+                elts = sl.elts if isinstance(sl, ast.Tuple) else [sl]
+                indices = list(elts) + indices
+                node = node.value
+            root = origin[node.id]
+            shape = arg_shapes[params.index(root)]
+            idx_values = []
+            for dim, idx in zip(shape, indices):
+                value = constants[idx.id] if isinstance(idx, ast.Name) else idx.value
+                idx_values.append(-1 if value == dim - 1 else value)
 
-    # Remove the return statement
-    last_func.body = last_func.body[:-2]
+            new_name = "%s_set%d" % (root, stmt_idx)
+            last_func.body[stmt_idx] = ast.Assign(
+                [ast.Name(new_name, ast.Store())],
+                ast.Call(
+                    ast.Name("set_at", ast.Load()),
+                    [
+                        ast.Name(last_value.get(root, root), ast.Load()),
+                        ast.Tuple([ast.Constant(i) for i in idx_values], ast.Load()),
+                        stmt.value,
+                    ],
+                    [],
+                ),
+                lineno=stmt.lineno,
+            )
+            origin[new_name] = root
+            last_value[root] = new_name
+    if last_func.body[-1].value is not None:
+        # The function returns a value: return the last newly computed value.
+        outputs = [ast.Name(new_values[-1] if new_values else last_call)]
+    else:
+        assert last_value
+        outputs = [ast.Name(last_value[param]) for param in params if param in last_value]
+    if len(outputs) == 1:
+        ret_value = outputs[0]
+    else:
+        ret_value = ast.Tuple(outputs, ast.Load())
 
-    # Add a return statement returning the value of the last function call
-    last_func.body.append(ast.Return(value=last_call))
+    # Replace the return statement
+    last_func.body = last_func.body[:-1]
+    last_func.body.append(ast.Return(value=ret_value))
 
     return ast.unparse(last_func)
 
+
+def get_fn(fn_str, fn_name):
+    fn_ast = ast.parse(fn_str)
+    fn_body = fn_ast.body
+    for stmt in fn_body:
+        if isinstance(stmt, ast.FunctionDef) and stmt.name == fn_name:
+            return stmt
+    return None
+
+
+def get_stmts_without_return(fn):
+    return [stmt for stmt in fn.body if not isinstance(stmt, ast.Return)]
 
 def get_fn(fn_str, fn_name):
     fn_ast = ast.parse(fn_str)
@@ -535,6 +664,8 @@ def inline_ast_functions(prog_str):
             # Get the called function
             called_fn_name = stmt.value.func.id
             called_fn = get_fn(prog_str, called_fn_name)
+            if called_fn is None:  # not an outlined function (e.g. set_at)
+                continue
 
             # Map the arguments of the called function to the arguments of the caller
             mapping = {}
@@ -645,6 +776,8 @@ def inline_stmts(prog_str):
                 return_stmt.value = call_stmt
             elif isinstance(call_stmt, ast.Name):
                 return_stmt.value = defs[call_stmt.id]
+            elif isinstance(call_stmt, ast.Tuple):
+                call_stmt.elts = [defs[e.id] if isinstance(e, ast.Name) else e for e in call_stmt.elts]
             else:
                 raise NotImplementedError
 
@@ -667,6 +800,20 @@ def restore_sizes(prog_str, sizes):
                             original_value = sizes[ele.value]
                             ele.value = original_value
 
+            # Mask sizes: jnp.tri(S), jnp.eye(S), and jnp.arange(S) < S - b.
+            def is_mask(node, names):
+                return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and node.func.attr in names and node.args
+                        and isinstance(node.args[0], ast.Constant) and node.args[0].value in sizes)
+
+            for node in ast.walk(stmt.value):  # visits a Compare before its operands
+                if isinstance(node, ast.Compare) and is_mask(node.left, ("arange",)):
+                    for comp in node.comparators:
+                        if isinstance(comp, ast.BinOp) and getattr(comp.left, "value", None) == node.left.args[0].value:
+                            comp.left.value = sizes[comp.left.value]
+                if is_mask(node, ("tri", "eye", "arange")):
+                    node.args[0].value = sizes[node.args[0].value]
+
     return ast.unparse(fn)
 
 
@@ -688,57 +835,27 @@ def normalize_identifiers(prog_str):
             mapping[id] = "v" + str(len(mapping) - n_args)
         return mapping[id]
 
-    # Rename the variables of the function
+    # Rename local names (arguments and assigned variables) at any depth: after
+    # inline_stmts, the body is typically a single nested expression.
+    local_ids = set(mapping)
     for stmt in fn.body:
         if isinstance(stmt, ast.Assign):
-            assert len(stmt.targets) == 1
-            target = stmt.targets[0]
-
-            if isinstance(target, ast.Name):
-                target.id = remap_id(target.id)
-            else:
-                print("ERROR: Unsupported target type %s" % type(target))
-                assert False
-
-            if isinstance(stmt.value, ast.Call):
-                for arg in stmt.value.args:
-                    if isinstance(arg, ast.Name):
-                        arg.id = remap_id(arg.id)
-            elif isinstance(stmt.value, ast.Name):
-                stmt.value.id = remap_id(stmt.value.id)
-            elif isinstance(stmt.value, ast.Constant):
-                pass
-            elif isinstance(stmt.value, ast.BinOp):
-                if isinstance(stmt.value.left, ast.Name):
-                    stmt.value.left.id = remap_id(stmt.value.left.id)
-                if isinstance(stmt.value.right, ast.Name):
-                    stmt.value.right.id = remap_id(stmt.value.right.id)
-            else:
-                print("ERROR: Unsupported value type %s" % type(stmt.value))
-                assert False
-
-        if isinstance(stmt, ast.Return):
-            if isinstance(stmt.value, ast.Name):
-                stmt.value.id = remap_id(stmt.value.id)
-            elif isinstance(stmt.value, ast.Call):
-                for arg in stmt.value.args:
-                    if isinstance(arg, ast.Name):
-                        arg.id = remap_id(arg.id)
-            elif isinstance(stmt.value, ast.Constant):
-                pass
-            else:
-                print("ERROR: Unsupported return value type %s" % type(stmt.value))
-                assert False
+            assert len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name)
+            local_ids.add(stmt.targets[0].id)
+    for stmt in fn.body:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Name) and node.id in local_ids:
+                node.id = remap_id(node.id)
 
     return ast.unparse(fn)
 
 
 class NumpyTarget(Target):
     def __init__(self) -> None:
-        return
+        self.arg_prologues = {}
 
     def get_candidates_for_arg_shapes(
-        self, arg_shapes, max_depth, ops=[], constants=[]
+        self, arg_shapes, max_depth, ops=[], constants=[], masks=()
     ):
         # Map op names to ops
         print(ops)
@@ -749,13 +866,13 @@ class NumpyTarget(Target):
         if len(operations) == 0:
             operations = NUMPY_GRAMMAR
 
-        candidates = enumerate_candidates(arg_shapes, operations, constants, max_depth)
+        candidates = enumerate_candidates(arg_shapes, operations, constants, max_depth, masks)
 
         return candidates
 
-    def get_stubs_for_arg_shapes(self, arg_shapes, max_depth, ops=[], constants=[]):
+    def get_stubs_for_arg_shapes(self, arg_shapes, max_depth, ops=[], constants=[], masks=()):
         candidates = self.get_candidates_for_arg_shapes(
-            arg_shapes, max_depth, ops, constants
+            arg_shapes, max_depth, ops, constants, masks
         )
 
         candidates_w_rhs_add = extend_candidates_w_rhs_add(candidates)
@@ -775,7 +892,8 @@ class NumpyTarget(Target):
             m = Module.parse(input_module)
             arg_shapes = get_arg_shapes(m)
 
-        return self.get_stubs_for_arg_shapes(arg_shapes, max_depth, ops, constants)
+        masks = get_partial_range_masks(input_module)
+        return self.get_stubs_for_arg_shapes(arg_shapes, max_depth, ops, constants, masks)
 
     def construct_function_ast(
         self, sol_sketch, source_function, func_idx, program_name
@@ -914,8 +1032,18 @@ class NumpyTarget(Target):
 
     def initialize_ast(self, module):
         self.main_function_py = replace_return_value(
-            get_last_function(affine_to_python(str(module)))
+            get_last_function(affine_to_python(str(module))),
+            get_returned_arg_idxs(module),
+            get_main_arg_shapes(module),
         )
+        # Synthesis assumes annotated arguments to be symmetric or unit lower
+        # triangular. The program first builds such a matrix from the lower
+        # triangle the kernel reads, so that it is correct for any argument.
+        main = [op for op in module.body.operations if isinstance(op, FuncOp)][-1]
+        attrs = [str(a) for a in main.arg_attrs] if "arg_attrs" in main.attributes else []
+        self.arg_prologues = {
+            i: PROLOGUES[a.strip("{}")] for i, a in enumerate(attrs) if a.strip("{}") in PROLOGUES
+        }
         self.changed_sizes = get_sizes(module)
 
         self.function_pys = []
@@ -927,7 +1055,14 @@ class NumpyTarget(Target):
         prog_str = restore_sizes(prog_str, self.changed_sizes)
         prog_str = inline_stmts(prog_str)
         prog_str = normalize_identifiers(prog_str)
+        prog_ast = ast.parse(prog_str)
+        fn = prog_ast.body[-1]
+        fn.body = [ast.parse("{a} = ".format(a=fn.args.args[i].arg) + p.format(a=fn.args.args[i].arg)).body[0]
+                   for i, p in sorted(self.arg_prologues.items())] + fn.body
+        prog_str = ast.unparse(prog_ast)
 
         prog_str = prog_str.replace("jnp.", "np.")
+        if "set_at(" in prog_str:
+            prog_str = SET_AT_PY + "\n\n" + prog_str
 
         return prog_str

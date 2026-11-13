@@ -7,9 +7,9 @@ module {
         %0 = affine.load %arg0[%arg2, %arg3] : memref<1000x1000xf64>
         %1 = affine.load %arg1[%arg2, %arg3] : memref<1000x1000xf64>
         %2 = arith.cmpf oeq, %1, %cst_0 : f64
-        %3 = arith.select %2, %cst_0, %1 : f64
-        %4 = arith.subf %cst_0, %3 : f64
-        %5 = arith.divf %0, %4 : f64
+        %3 = arith.subf %cst_0, %1 : f64
+        %4 = arith.divf %0, %3 : f64
+        %5 = arith.select %2, %cst_0, %4 : f64
         affine.store %5, %arg0[%arg2, %arg3] : memref<1000x1000xf64>
       }
     }

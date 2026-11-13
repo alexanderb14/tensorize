@@ -1,3 +1,5 @@
+import re as regex  # "re" is shadowed by sympy.re through star imports
+
 import mlir_synth.synth as mlir_synth
 from mlir_synth.dialects.func import *
 from mlir_synth.ir import *
@@ -82,6 +84,65 @@ def get_sizes(module):
     }
 
     return changed_sizes
+
+
+def has_multi_output_functions(module):
+    """Whether an outlined function stores to more than one memref argument
+    (outlined functions only return the last stored one)."""
+    for op in module.body.operations:
+        if isinstance(op, FuncOp) and "irsynth.original" in op.attributes:
+            if len(set(regex.findall(r"affine\.store [^,]+, (%arg\d+)\[", str(op)))) > 1:
+                return True
+    return False
+
+
+def trace_final_args(module_str):
+    """Symbolically executes the (single) function of a module and returns the
+    final value of each argument (0 for integer arguments, which are unused
+    after the sizes were changed)."""
+    with Context():
+        mlir_synth.register_dialects()
+        mlir_synth.register_passes()
+        module = Module.parse(module_str)
+        func = get_function(module)
+        args = []
+        for arg_idx, arg in enumerate(func.regions[0].blocks[0].arguments):
+            name = "A_%d" % arg_idx
+            if MemRefType.isinstance(arg.type):
+                mr = MemRefType(arg.type)
+                args.append(get_symbols_nd(name, mr.shape, ArgProperty.Regular))
+            elif F64Type.isinstance(arg.type):
+                args.append(get_symbols_nd(name, [], ArgProperty.Regular))
+            else:
+                args.append(0)
+    run(affine_to_python(module_str), args)
+    return args
+
+
+def get_partial_range_masks(function_str):
+    """
+    (S, a, b) for each 1-D memref argument of size S that a loop with constant
+    bounds stores to only at the indices a .. S-1-b (index `%iv + c`), e.g.
+    `affine.for %i = 1 to N { affine.store ..., %b[%i - 1] }`.
+    """
+    header = regex.search(r"func\.func @\w+\(([^)]*)\)", function_str)
+    args = set(regex.findall(r"(%arg\d+):", header.group(1))) if header else set()
+    masks, loops = set(), []
+    for line in function_str.splitlines()[1:]:
+        m = regex.match(r"\s*affine\.for (%\w+) = (\d+) to (\d+) \{", line)
+        if m or line.rstrip().endswith("{"):
+            loops.append((m.group(1), int(m.group(2)), int(m.group(3))) if m else None)
+        elif line.strip().startswith("}") and loops:
+            loops.pop()
+        m = regex.match(r"\s*affine\.store [^,]+, (%\w+)\[\s*(%\w+)\s*(?:([+-])\s*(\d+))?\s*\] "
+                        r": memref<(\d+)xf64>", line)
+        bounds = {l[0]: l[1:] for l in loops if l}
+        if m and m.group(1) in args and m.group(2) in bounds:
+            c = int(m.group(4) or 0) * (-1 if m.group(3) == "-" else 1)
+            size, (lo, hi) = int(m.group(5)), bounds[m.group(2)]
+            if 0 <= lo + c <= hi - 1 + c <= size - 1 and (lo + c, hi - 1 + c) != (0, size - 1):
+                masks.add((size, lo + c, size - hi - c))
+    return sorted(masks)
 
 
 def dedup_irs(irs):

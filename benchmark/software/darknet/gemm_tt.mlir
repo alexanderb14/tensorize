@@ -15,7 +15,9 @@ module {
           affine.store %6, %alloca[] : memref<f64>
         }
         %0 = affine.load %alloca[] : memref<f64>
-        affine.store %0, %arg3[%arg4, %arg5] : memref<1000x1000xf64>
+        %7 = affine.load %arg3[%arg4, %arg5] : memref<1000x1000xf64>
+        %8 = arith.addf %7, %0 : f64
+        affine.store %8, %arg3[%arg4, %arg5] : memref<1000x1000xf64>
       }
     }
     return

@@ -281,6 +281,40 @@ void changeGlobals(ModuleOp &moduleOp, SizeMap &newSizes) {
   });
 }
 
+// Changes constant indices that denote the last element of a dimension, e.g.
+// affine.store %v, %A[1199, 1199] : memref<1200x1200xf64>. (Only if the index
+// is larger than all changed sizes, so that small indices stay unchanged.)
+void changeAccessIndices(func::FuncOp &func, SizeMap &newSizes) {
+  int64_t maxNewSize = 0;
+  for (auto &entry : newSizes)
+    maxNewSize = std::max(maxNewSize, entry.second);
+
+  func->walk([&](Operation *op) {
+    AffineMap map;
+    StringRef attrName;
+    if (auto loadOp = dyn_cast<AffineLoadOp>(op)) {
+      map = loadOp.getAffineMap();
+      attrName = loadOp.getMapAttrStrName();
+    } else if (auto storeOp = dyn_cast<AffineStoreOp>(op)) {
+      map = storeOp.getAffineMap();
+      attrName = storeOp.getMapAttrStrName();
+    } else {
+      return;
+    }
+    llvm::SmallVector<AffineExpr> exprs;
+    for (auto expr : map.getResults()) {
+      auto c = expr.dyn_cast<AffineConstantExpr>();
+      if (c && c.getValue() >= maxNewSize && newSizes.count(c.getValue() + 1))
+        expr = getAffineConstantExpr(newSizes[c.getValue() + 1] - 1,
+                                     op->getContext());
+      exprs.push_back(expr);
+    }
+    op->setAttr(attrName, AffineMapAttr::get(AffineMap::get(
+                              map.getNumDims(), map.getNumSymbols(), exprs,
+                              op->getContext())));
+  });
+}
+
 void changeLoopBounds(func::FuncOp &func, SizeMap &newSizes) {
   bool debug = false;
 
@@ -370,18 +404,10 @@ void ChangeSizesPass::runOnOperation() {
   auto operation = getOperation();
 
   if (this->mode == "minify") {
-    // Get size mode.
+    // Get size mode. (A change_sizes.size_mode attribute of the input is
+    // ignored: in the Uniform mode, different sizes become the same size, and
+    // the original sizes cannot be restored unambiguously.)
     std::string sizeMode = this->sizeMode.getValue();
-    operation->walk([&](Operation *op) {
-      if (isa<func::FuncOp>(op)) {
-        auto func = cast<func::FuncOp>(op);
-
-        auto changedSizesModeAttr = func->getAttr("change_sizes.size_mode");
-        if (changedSizesModeAttr) {
-          sizeMode = changedSizesModeAttr.cast<StringAttr>().getValue().str();
-        }
-      }
-    });
 
     auto minifiedSizes = getMinifedSizeMap(operation, sizeMode);
     changeGlobals(operation, minifiedSizes);
@@ -393,6 +419,7 @@ void ChangeSizesPass::runOnOperation() {
         changeTypeSizes<MemRefType>(func, minifiedSizes);
         changeTypeSizes<RankedTensorType>(func, minifiedSizes);
         changeLoopBounds(func, minifiedSizes);
+        changeAccessIndices(func, minifiedSizes);
         changeConstantValues(func, minifiedSizes);
 
         annotateChangedSizes(func, minifiedSizes);

@@ -291,14 +291,12 @@ def dedup_sketches(sketches):
     """
 
     # Create a list of tuples (expression, sketch) in parallel
-    ctx = multiprocessing.get_context("spawn")
-    with ctx.Pool(os.cpu_count(), initializer=init_args) as pool:
-        expr_strs = smart_map(
-            str,
-            [s.expression for s in sketches],
-            desc="Deduplicating sketches - Creating expressions",
-            spawn=True,
-        )
+    expr_strs = smart_map(
+        str,
+        [s.expression for s in sketches],
+        desc="Deduplicating sketches - Creating expressions",
+        spawn=True,
+    )
 
     tuples = list(zip(expr_strs, sketches))
 
@@ -417,7 +415,7 @@ def solve_sketch(task):
         print("Matched Sketch expression: ", sketch.expression)
         # print("Match solution: ", match_solution)
         match_solution_list = [
-            match_solution[k] for k in sorted(match_solution.keys(), reverse=True)
+            match_solution[k] for k in sorted(match_solution.keys())
         ]
         return [SolutionSketch(match_solution_list, sketch, True)], stats
 
@@ -459,7 +457,7 @@ def solve_sketch(task):
 
 def solve_sketches(spec, sketches):
     ctx = multiprocessing.get_context("spawn")
-    with ctx.Pool(os.cpu_count(), initializer=init_args) as pool:
+    with ctx.Pool(NUM_CPUS, initializer=init_args) as pool:
         tasks = [(spec, sketch) for sketch in sketches]
         if FLAGS.debug:
             solutions_nested = []
